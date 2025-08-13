@@ -8,6 +8,7 @@
                 <field name="sequence" widget="handle" />
                 <field name="name" />
                 <field name="description" />
+                <field name="description_template_type" />
                 <field name="model" />
                 <field name="active" widget="boolean_toggle" />
             </tree>
@@ -37,6 +38,7 @@
                         <group>
                             <field name="active" invisible="1" />
                             <field name="description" />
+                            <field name="description_template_type" />
                         </group>
                     </group>
                     <group>
@@ -66,6 +68,19 @@
                             />
                         </page>
                         <page
+                            name="description_variables_code"
+                            string="Description Code"
+                            attrs="{'invisible': [('description_template_type','!=','variables')]}"
+                        >
+                            <field
+                                name="description_variables_code"
+                                widget="ace"
+                                options="{'mode': 'python'}"
+                                placeholder="Enter Python code here. Help about Python expression is available in the help tab of this document."
+                                attrs="{'required': [('description_template_type','=','variables')]}"
+                            />
+                        </page>
+                        <page
                             name="help"
                             string="Help"
                             attrs="{'invisible': [('exception_type','!=','by_py_code')]}"
@@ -75,11 +90,20 @@
                                     <h3>Help with Python expressions</h3>
                                     <p
                                     >Various fields may use Python code or Python expressions. The following variables can be used:</p>
+                                    <p>For the exception rule code</p>
                                     <ul>
                                         <li><code
                                             >self</code>: Record on which the rule is evaluated.</li>
                                         <li>To block the exception use: <code
                                             >failed = True</code></li>
+                                    </ul>
+                                    <p>For the description code to set the variables</p>
+                                    <ul>
+                                        <li><code
+                                            >object</code>: Record on which the rule was evaluated on.</li>
+                                        <li
+                                        >To set variables assign values to them: <code
+                                            >var1 = object.name</code></li>
                                     </ul>
                                     <p
                                     >As well as all the libraries provided in safe_eval.</p>

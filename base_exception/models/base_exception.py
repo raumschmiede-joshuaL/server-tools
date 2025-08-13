@@ -1,5 +1,6 @@
 # Copyright 2011 Raphaël Valyi, Renato Lima, Guewen Baconnier, Sodexis
 # Copyright 2017 Akretion (http://www.akretion.com)
+# Copyright 2025 Raumschmiede GmbH
 # Mourad EL HADJ MIMOUNE <mourad.elhadj.mimoune@akretion.com>
 # Copyright 2020 Hibou Corp.
 # License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl.html).
@@ -21,7 +22,43 @@ class ExceptionRule(models.Model):
     _order = "active desc, sequence asc"
 
     name = fields.Char("Exception Name", required=True, translate=True)
-    description = fields.Text("Description", translate=True)
+    description = fields.Text(
+        "Description",
+        translate=True,
+        help="You can use placeholders here. The placeholder syntax depends on "
+        "the description template type.\n"
+        "Examples:\n\n"
+        "Jinja: 'Product with SKU ${record.default_code} has no costs set'\n\n"
+        "Variables: 'Product with SKU {var1} has no costs set'.\n"
+        "In code: 'var1 = record.default_code'",
+    )
+    description_template_type = fields.Selection(
+        [
+            ("plain", "Text"),
+            ("jinja", "Jinja"),
+            ("variables", "Variables"),
+        ],
+        default="plain",
+        required=True,
+        help="Define how the text in the description field shall be handled.\n"
+        "Text: Use the description as it is without formatting it\n"
+        "Jinja: You can use custom ${object.field} syntax to define dynamic "
+        "values in the description\n"
+        "Variables: You can use custom {var1} syntax in the description. In the page "
+        "Description Code you have to set all variables: var1 = object.field",
+    )
+    description_variables_code = fields.Text(
+        "Description Variables",
+        help="For each variable enclosed in curly brackets in the description you must"
+        " assign a value to a variable in the code with the same name.\n"
+        "Variables available: object, exception_rule\n"
+        "Example:\n"
+        "Description: 'Product with SKU {sku} contains invalid characters: {chars}\n"
+        "Code:\n"
+        "sku = object.default_code\n"
+        "invalid_chars = ['!', '$', '?']\n"
+        "chars = ', '.join([c for c in invalid_chars if c in object.name])",
+    )
     sequence = fields.Integer(
         string="Sequence", help="Gives the sequence order when applying the test"
     )
@@ -76,6 +113,97 @@ class ExceptionRule(models.Model):
         self.ensure_one()
         return safe_eval(self.domain)
 
+    def get_description(self, record):
+        self.ensure_one()
+
+        if not self.description:
+            return ""
+
+        if self.description_template_type == "plain":
+            return self.description
+        elif self.description_template_type == "jinja":
+            return self._render_description_by_jinja(record)
+        elif self.description_template_type == "variables":
+            return self._render_description_by_variables(record)
+
+    def description_needs_rendering(self):
+        self.ensure_one()
+
+        return self.description and self.description_template_type != "plain"
+
+    def _render_description_by_jinja(self, record):
+        self.ensure_one()
+
+        res = None
+        try:
+            res = self.env["mail.render.mixin"]._render_template(
+                self.description,
+                record._name,
+                [record.id],
+                add_context=self._render_description_context(record),
+            )[record.id]
+
+            # Check _render_template_jinja. If the template cannot be loaded,
+            # an error is logged an an empty string returned. If self.description
+            # is not set, it will not call _render_description_by_jinja
+            if not res:
+                raise UserError(_("The description contains invalid Jinja syntax"))
+        except UserError as e:
+            raise UserError(
+                _(
+                    "Exception rule '%(rule)s' has an invalid Jinja description.\n"
+                    "The following error was raised while rendering it:\n\n %(error)s",
+                    rule=self.name,
+                    error=e,
+                )
+            )
+
+        return res
+
+    def _render_description_by_variables(self, record):
+        code_vars = self._render_description_eval_code(record)
+        text = self.description
+
+        try:
+            text = text.format(**code_vars)
+        except KeyError as e:
+            raise UserError(
+                _(
+                    "Exception rule '%(rule)s' has an invalid description code.\n"
+                    "It does not assign a value to the following variable: %(var)s",
+                    rule=self.name,
+                    var=e.args[0],
+                ),
+            )
+
+        return text
+
+    def _render_description_context(self, record):
+        self.ensure_one()
+
+        return {
+            "exception": self,
+            "object": record,
+        }
+
+    def _render_description_eval_code(self, record):
+        space = self._render_description_context(record)
+        expr = self.description_variables_code
+
+        try:
+            safe_eval(expr, space, mode="exec", nocopy=True)
+        except Exception as e:
+            raise UserError(
+                _(
+                    "Couldn't render the description of exception rule '%(rule)s'.\n"
+                    "Following error was raised:\n%(error)s",
+                    rule=self.name,
+                    error=e,
+                )
+            )
+
+        return space
+
 
 class BaseExceptionMethod(models.AbstractModel):
     _name = "base.exception.method"
@@ -92,6 +220,13 @@ class BaseExceptionMethod(models.AbstractModel):
 
     def _reverse_field(self):
         raise NotImplementedError()
+
+    def _get_sub_exception_field_names(self):
+        """
+        Used in case exceptions need to be checked on underlying records and the
+        detected exceptions need to be added to the parent record.
+        """
+        return []
 
     def _rule_domain(self):
         """Filter exception.rules.
@@ -141,6 +276,13 @@ class BaseExceptionMethod(models.AbstractModel):
             records.write({"exception_ids": [(3, rule_id)]})
         for rule_id, records in rules_to_add.items():
             records.write({"exception_ids": [(4, rule_id)]})
+
+        # Detect exceptions on underlying sub-records if needed. If the sub-records'
+        # model defines the current model in _get_main_records and _reverse_field,
+        # the exceptions detected are added to the current record
+        for field in self._get_sub_exception_field_names():
+            all_exception_ids += self.mapped(field).detect_exceptions()
+
         return all_exception_ids
 
     @api.model
@@ -248,28 +390,61 @@ class BaseExceptionModel(models.AbstractModel):
             else:
                 rec.main_exception_id = False
 
-    @api.depends("exception_ids", "ignore_exception")
+    @api.depends(
+        "exception_ids",
+        "exception_ids.description_template_type",
+        "exception_ids.description_variables_code",
+        "ignore_exception",
+    )
     def _compute_exceptions_summary(self):
         for rec in self:
             if rec.exception_ids and not rec.ignore_exception:
-                rec.exceptions_summary = "<ul>%s</ul>" % "".join(
-                    [
-                        "<li>%s: <i>%s</i> <b>%s<b></li>"
-                        % tuple(
-                            map(
-                                html.escape,
-                                (
-                                    e.name,
-                                    e.description or "",
-                                    _("(Blocking exception)") if e.is_blocking else "",
-                                ),
-                            )
-                        )
-                        for e in rec.exception_ids
-                    ]
-                )
+                rec.exceptions_summary = rec._get_exception_summary()
             else:
                 rec.exceptions_summary = False
+
+    def _get_exception_summary(self):
+        self.ensure_one()
+
+        summaries = []
+        sub_fields = self._get_sub_exception_field_names()
+
+        for e in self.exception_ids:
+            if e.model == self._name:
+                summaries.append(self._get_exception_summary_for_exception_rule(e))
+                continue
+
+            for field in sub_fields:
+                sub_records = self.mapped(field)
+                if e.model != sub_records._name:
+                    continue
+
+                for sub_record in sub_records:
+                    if e in sub_record.exception_ids:
+                        sub_summary = (
+                            sub_record._get_exception_summary_for_exception_rule(e)
+                        )
+                        # Duplicates are possible if an exception of a sub-record
+                        # has a plain text description. Do not use a set as a set
+                        # will not preserve the order of exceptions
+                        if sub_summary not in summaries:
+                            summaries.append(sub_summary)
+
+        return "<ul>%s</ul>" % "".join(summaries)
+
+    def _get_exception_summary_for_exception_rule(self, rule):
+        self.ensure_one()
+
+        return "<li>%s: <i>%s</i> <b>%s</b></li>" % tuple(
+            map(
+                html.escape,
+                (
+                    rule.name,
+                    rule.get_description(self) or "",
+                    _("(Blocking exception)") if rule.is_blocking else "",
+                ),
+            )
+        )
 
     def _popup_exceptions(self):
         action = self._get_popup_action().sudo().read()[0]

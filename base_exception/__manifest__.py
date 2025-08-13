@@ -12,7 +12,7 @@
     exceptions to be applied on different models (sale order, invoice, ...)""",
     "author": "Akretion, Sodexis, Camptocamp, Odoo Community Association (OCA)",
     "website": "https://github.com/OCA/server-tools",
-    "depends": ["base_setup"],
+    "depends": ["base_setup", "mail"],
     "maintainers": ["hparfr", "sebastienbeau"],
     "license": "AGPL-3",
     "data": [
